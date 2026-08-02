@@ -1,0 +1,7 @@
+# 备份/密码等敏感文件不入库
+*.tar.gz
+*.rdb
+*.aof
+.redispass
+backup/
+.env
