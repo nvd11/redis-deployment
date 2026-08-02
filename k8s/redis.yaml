@@ -1,0 +1,117 @@
+# ============================================================
+# Redis on K3s (Kubernetes) — 当前生产方案
+# ============================================================
+# 目标: 部署到腾讯云 K3s 集群的 OCI free-arm-vm worker 节点
+# 网络: hostNetwork 直接绑定节点 6379 端口 (不经 KIC/Ingress)
+#       外部 (LiteLLM @ GCP 伦敦) 经 Tailscale 直连 100.105.130.0:6379
+# 持久化: local-path PVC (K3s 自带存储类, 数据落 free-arm-vm 本地磁盘)
+#
+# 用法:
+#   kubectl apply -f k8s/redis.yaml
+#   kubectl -n redis get pods -o wide   # 确认调度到 free-arm-vm
+#
+# 验证 (从集群外):
+#   redis-cli -h 100.105.130.0 -p 6379 -a <PASSWORD> ping
+# ============================================================
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: redis
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: redis-secret
+  namespace: redis
+type: Opaque
+stringData:
+  # TODO: 替换为强密码，或从外部 secrets 管理注入
+  # kubectl create secret generic redis-secret --from-literal=redis-password='CHANGE_ME' -n redis
+  redis-password: CHANGE_ME
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redis-data
+  namespace: redis
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: local-path
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis
+  namespace: redis
+  labels:
+    app: redis
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      # 钉在 OCI ARM worker，避免调度到其他架构节点
+      nodeSelector:
+        kubernetes.io/hostname: free-arm-vm
+      # hostNetwork: 直接绑定节点 6379，外部可经 Tailscale IP 直连
+      hostNetwork: true
+      containers:
+        - name: redis
+          image: redis:7.2-alpine
+          imagePullPolicy: IfNotPresent
+          command:
+            - redis-server
+            - --appendonly
+            - "yes"
+            - --appendfsync
+            - everysec
+            - --requirepass
+            - "$(REDIS_PASSWORD)"
+          env:
+            - name: REDIS_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: redis-secret
+                  key: redis-password
+          ports:
+            - containerPort: 6379
+              hostPort: 6379
+          volumeMounts:
+            - name: redis-data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - redis-cli -a "$REDIS_PASSWORD" --no-auth-warning ping | grep -q PONG
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - redis-cli -a "$REDIS_PASSWORD" --no-auth-warning ping | grep -q PONG
+            initialDelaySeconds: 5
+            periodSeconds: 10
+      volumes:
+        - name: redis-data
+          persistentVolumeClaim:
+            claimName: redis-data

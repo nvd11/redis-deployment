@@ -1,92 +1,106 @@
 # Redis 规范化部署 (redis-deployment)
 
-Redis 单机规范化部署的 GitOps 仓库。提供 **两种部署方式**：
-- 🐳 **Docker Compose（推荐）**：声明式、可复现、Redis + RedisInsight 一条命令全起
-- 📦 **apt + systemd（备选）**：传统方式，资源开销最低
+Redis 规范化部署的 GitOps 仓库。**当前生产方案：Kubernetes (K3s) 部署**，另有 Docker Compose 与 apt 两种备选。
 
-## 📦 仓库结构
+## 当前架构 (2026-08)
 
 ```
-redis-deployment/
-├── docker-compose.yml         # [推荐] Redis + RedisInsight 编排
-├── docker-up.sh               # [推荐] 一键 Compose 部署 (自动生成密码)
-├── install.sh                 # apt 方式安装脚本
-├── config/redis.conf          # apt 方式配置模板 (混合持久化, 密码认证)
-├── .env.example               # Compose 密码模板 (不入库)
-└── scripts/
-    ├── backup.sh              # 本地打包 + 可选远程推送备份
-    ├── redisinsight.sh        # (apt 方式) RedisInsight Web UI
-    └── healthcheck.sh         # (apt 方式) 健康检查
+GCP 伦敦 (europe-west2-c)                 OCI 新加坡 (ap-singapore-1)
++----------------------------+  Tailscale   +----------------------------------+
+|  LiteLLM Proxy (实验 app)   | --直连 168ms-+> |  free-arm-vm (4C24G ARM)         |
+|  . prompt 缓存 + 限流        |              |  K3s worker, hostNetwork Redis   |
+|  . Redis 客户端              |              |  100.105.130.0:6379              |
++----------------------------+              +----------------------------------+
+        |  A
+        |  | 计费/评测数据 (已有通道)
+        v  |
+   OCI MySQL rin-heatwave (10.0.0.247:3306, 新加坡)
 ```
 
-## 🚀 快速开始 (Docker Compose 方式)
+**数据路径**: LiteLLM -> Tailscale P2P 直连 -> 100.105.130.0:6379（free-arm-vm 节点 IP），**不过 KIC/Ingress**。Redis 用 `hostNetwork` 直接绑节点 6379 端口，无 NodePort 映射层。约 168ms 延迟对 prompt 缓存场景完全可接受（LLM 调用本身是秒级）。
+
+**LiteLLM 侧启用 Redis 缓存配置** (config.yaml):
+
+```yaml
+cache: true
+cache_params:
+  type: redis
+  host: 100.105.130.0
+  port: 6379
+  password: YOUR_STRONG_PASSWORD
+```
+
+连接参数: host `100.105.130.0`, port `6379`, 密码通过环境变量注入（勿写入明文配置文件）。
+
+## Kubernetes (K3s) 部署 —— 当前方案
+
+### Manifest: `k8s/redis.yaml`
 
 ```bash
-# 1. 克隆仓库到目标机器 (如 OCI Heavy Node 134.185.90.98)
-git clone https://github.com/nvd11/redis-deployment.git
-cd redis-deployment
+# 1. 替换密码 (或从 secrets 管理注入)
+kubectl create secret generic redis-secret \
+  --from-literal=redis-password='YOUR_STRONG_PASSWORD' -n redis
 
-# 2. 一键部署 (自动生成随机密码到 .env，权限 600)
-sudo bash docker-up.sh
+# 2. 部署
+kubectl apply -f k8s/redis.yaml
 
-# 3. 访问 RedisInsight: http://<tailscale-ip>:5540
-#    UI 中添加连接: host=redis, port=6379, password=见 .env
+# 3. 确认调度到 free-arm-vm
+kubectl -n redis get pods -o wide
+
+# 4. 从集群外验证 (LiteLLM 所在机器或任意 Tailscale 节点)
+redis-cli -h 100.105.130.0 -p 6379 -a YOUR_STRONG_PASSWORD ping   # 应返回 PONG
 ```
 
-### Compose 细节
-- `redis` 容器: `redis:7.2-alpine`，AOF 混合持久化挂载 `redis-data` 卷
-- `redisinsight` 容器: 官方镜像，数据卷 `redisinsight-data`
-- **端口只绑 127.0.0.1**，公网访问必须走 nginx 反代 + 认证
-- 密码通过 `.env` 注入 (`REDIS_PASSWORD`)，`.env` 已在 `.gitignore` 中
-
-## 🚀 快速开始 (apt 方式)
-
-```bash
-# 1. 克隆仓库
-git clone https://github.com/nvd11/redis-deployment.git
-cd redis-deployment
-
-# 2. 一键安装 (自动生成随机密码，写入 /etc/redis/.redispass)
-sudo bash install.sh
-
-# 3. 健康检查
-sudo bash scripts/healthcheck.sh
-
-# 4. 可选: 部署 RedisInsight Web UI
-sudo bash scripts/redisinsight.sh
-
-# 5. 可选: 配置每日备份 + 推送远程节点
-# crontab -e
-0 2 * * * /opt/redis-deployment/scripts/backup.sh --remote gateman@100.115.214.26:/home/gateman/redis-backups
-```
-
-## ⚙️ 配置要点
+### K8s Manifest 要点
 
 | 项目 | 配置 | 说明 |
 |------|------|------|
-| 持久化 | `appendonly yes` + `aof-use-rdb-preamble yes` | RDB 快照 + AOF 增量混合模式，最多丢 1 秒数据 |
-| 安全 | `requirepass` (随机生成) | Compose: `.env` 注入；apt: `/etc/redis/.redispass` (600) |
-| 网络 | `bind 127.0.0.1` + `protected-mode yes` | 默认仅本地访问，公网访问必须经 nginx 反代 + 认证 |
-| 内存 | `maxmemory-policy noeviction` | 实验环境不限制内存；生产建议设置 `maxmemory` + `allkeys-lru` |
+| 网络 | `hostNetwork: true` | 直接绑节点 6379，外部经 Tailscale IP 直连，不过 KIC |
+| 调度 | `nodeSelector: kubernetes.io/hostname=free-arm-vm` | 钉在 OCI ARM worker，避免跨架构/跨区域漂移 |
+| 持久化 | `local-path` PVC (10Gi) | K3s 自带存储类，数据落 free-arm-vm 本地磁盘 |
+| 高可用 | 单副本 + liveness/readiness 探针 | 实验场景；需要 HA 时改 StatefulSet + 多副本 + 主从 |
+| 密码 | Secret 注入 | `CHANGE_ME` 占位符必须替换 |
 
-## 🔐 安全须知
+## 备选: Docker Compose 方式
 
-- Redis 默认仅绑定本地 (127.0.0.1)，**不要**直接暴露公网 6379 端口
-- 需要公网访问时：nginx 反代 + Basic Auth → RedisInsight (5540)，Redis 本身保持本地
-- 密码勿提交到 Git，使用 `.env` (Compose) 或 `/etc/redis/.redispass` (apt)
+```bash
+sudo bash docker-up.sh   # 自动生成 .env 随机密码, Redis + RedisInsight 一条命令全起
+```
+- 适用于**没有 K8s 的单机环境**（如裸机实验）
+- 端口只绑 `127.0.0.1`，公网访问走 nginx 反代 + Basic Auth
 
-## 📌 备份策略
+## 备选: apt + systemd 方式
 
-- Compose: Redis 数据在 `redis-data` 卷 (`docker volume`)，备份方式:
+```bash
+sudo bash install.sh     # apt 装 redis-server, 配置注入, 随机密码到 /etc/redis/.redispass
+sudo bash scripts/healthcheck.sh
+```
+- 资源开销最低（无 Docker daemon），适合小内存机器
+- RedisInsight: `sudo bash scripts/redisinsight.sh`
+
+## 备份策略
+
+- **K8s**: 数据在 `redis-data` PVC (local-path)，落于 `/var/lib/rancher/k3s/storage/`，备份:
   ```bash
-  docker run --rm -v redis-deployment_redis-data:/data -v /backup:/backup alpine \
-    tar czf /backup/redis-$(date +%F).tar.gz -C /data .
+  kubectl -n redis exec deploy/redis -- redis-cli -a $PASS --no-auth-warning BGSAVE
+  # 然后 tar PVC 数据目录或按 local-path 卷备份
   ```
-- apt: `/backup/redis-<日期>.tar.gz`，保留最近 7 份 (`--keep`)
-- 远程: 推送至 Moon 跳板机 `100.115.214.26:/home/gateman/redis-backups/`
-- 还原: 解压至数据目录后重启容器/服务
+- **Compose/apt**: `scripts/backup.sh --remote gateman@100.115.214.26:/home/gateman/redis-backups`
+- 远程备份目标: Moon 跳板机 `100.115.214.26`
 
-## 🧪 实验环境
+## 安全须知
 
-推荐部署节点: **OCI Heavy Node** `134.185.90.98` (4C24G ARM, Always Free)
-共享入口 nginx 规划中。
+- Redis 默认仅绑定 Tailscale/内网可达地址，**不要**直接暴露公网 6379
+- 需要公网访问时：nginx 反代 + Basic Auth -> RedisInsight (5540)，Redis 本身保持私网
+- 密码一律通过 Secret/`.env` 管理，**绝不入库**
+- K8s 集群内 `kubectl` 访问权限要收敛（Redis 密码在 Secret 中可见）
+
+## 环境速查
+
+| 组件 | 位置 | 地址 |
+|------|------|------|
+| LiteLLM Proxy | GCP 伦敦 europe-west2-c | Alice VM (Tailscale 100.94.13.17) |
+| Redis | OCI 新加坡 ap-singapore-1 | free-arm-vm, `100.105.130.0:6379` |
+| MySQL (计费) | OCI Singapore | rin-heatwave, `10.0.0.247:3306` |
+| K3s 集群 | 腾讯云 + OCI + NUC | 3 节点 (vm-0-2-debian / free-arm-vm / nuc) |
+| KIC (Kong) | 腾讯云 K3s | kong-system namespace (HTTP 网关, 与 Redis 无关) |
