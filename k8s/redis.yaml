@@ -1,17 +1,19 @@
 # ============================================================
 # Redis on K3s (Kubernetes) — 当前生产方案
 # ============================================================
-# 目标: 部署到腾讯云 K3s 集群的 OCI free-arm-vm worker 节点
-# 网络: hostNetwork 直接绑定节点 6379 端口 (不经 KIC/Ingress)
-#       外部 (LiteLLM @ GCP 伦敦) 经 Tailscale 直连 100.105.130.0:6379
+# 目标: 部署到 K3s 集群的 OCI free-arm-vm worker 节点
+# 网络: ClusterIP Service 暴露 6379, 经 Kong Gateway L4 Stream 对外
+#       (客户端 -> Kong :6379 -> TCPIngress -> redis Service -> redis Pod)
+#       不再使用 hostNetwork 直绑节点端口 (避免与 Kong 6379 冲突)
 # 持久化: local-path PVC (K3s 自带存储类, 数据落 free-arm-vm 本地磁盘)
 #
 # 用法:
 #   kubectl apply -f k8s/redis.yaml
 #   kubectl -n redis get pods -o wide   # 确认调度到 free-arm-vm
+#   kubectl -n redis get svc            # redis ClusterIP Service
 #
-# 验证 (从集群外):
-#   redis-cli -h 100.105.130.0 -p 6379 -a <PASSWORD> ping
+# 验证 (经 Kong Gateway, 从集群外):
+#   redis-cli -h <节点TailscaleIP> -p 6379 -a <PASSWORD> ping
 # ============================================================
 apiVersion: v1
 kind: Namespace
@@ -62,8 +64,6 @@ spec:
       # 钉在 OCI ARM worker，避免调度到其他架构节点
       nodeSelector:
         kubernetes.io/hostname: free-arm-vm
-      # hostNetwork: 直接绑定节点 6379，外部可经 Tailscale IP 直连
-      hostNetwork: true
       containers:
         - name: redis
           image: redis:7.2-alpine
@@ -84,7 +84,7 @@ spec:
                   key: redis-password
           ports:
             - containerPort: 6379
-              hostPort: 6379
+              name: redis
           volumeMounts:
             - name: redis-data
               mountPath: /data
@@ -115,3 +115,37 @@ spec:
         - name: redis-data
           persistentVolumeClaim:
             claimName: redis-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: redis
+  labels:
+    app: redis
+spec:
+  type: ClusterIP
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: 6379
+---
+# ============================================================
+# Kong TCPIngress: 把 Kong Gateway 的 6379 L4 Stream 流量
+# 转发到 Redis ClusterIP Service
+# ============================================================
+apiVersion: configuration.konghq.com/v1beta1
+kind: TCPIngress
+metadata:
+  name: redis-tcp
+  namespace: redis
+  annotations:
+    kubernetes.io/ingress.class: kong
+spec:
+  rules:
+    - port: 6379
+      backend:
+        serviceName: redis
+        servicePort: 6379
