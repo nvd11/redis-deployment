@@ -1,6 +1,6 @@
 # Redis 规范化部署 (redis-deployment)
 
-Redis 规范化部署的 GitOps 仓库。**当前生产方案：Kubernetes (K3s) 部署 + ArgoCD GitOps 自动发布**，另有 Docker Compose 与 apt 两种备选。
+Redis 规范化部署的 GitOps 仓库。**当前生产方案：ArgoCD 自动部署到 OCI free-arm-vm（K3s 集群），客户端经 Kong Gateway L4 Stream 连接**，另有 Docker Compose 与 apt 两种备选。
 
 ## 当前架构 (2026-08)
 
@@ -8,57 +8,127 @@ Redis 规范化部署的 GitOps 仓库。**当前生产方案：Kubernetes (K3s)
 GCP 伦敦 (europe-west2-c)                 OCI 新加坡 (ap-singapore-1)
 +----------------------------+  Tailscale   +----------------------------------+
 |  LiteLLM Proxy (实验 app)   | --直连 168ms-+> |  free-arm-vm (4C24G ARM)         |
-|  . prompt 缓存 + 限流        |              |  K3s worker, hostNetwork Redis   |
-|  . Redis 客户端              |              |  100.105.130.0:6379              |
-+----------------------------+              +----------------------------------+
-        |  A
-        |  | 计费/评测数据 (已有通道)
-        v  |
-   OCI MySQL rin-heatwave (10.0.0.247:3306, 新加坡)
+|  . prompt 缓存 + 限流        |              |  K3s worker                      |
+|  . Redis 客户端              |              |  Redis Pod (10.43.x.x:6379)     |
++----------------------------+              |  ClusterIP Service (redis:6379)   |
+        |  A                                 +--------------+-------------------+
+        |  | 计费/评测数据 (已有通道)                         |
+        v  |                                       Kong Gateway (DaemonSet)
+   OCI MySQL rin-heatwave (10.0.0.247:3306, 新加坡)     3 节点 L4 Stream:6379
+                                              ^                        |
+                                              | TCPIngress (redis-tcp)  |
+                                              +------------------------+
+                                             客户端 -> Kong :6379 -> Redis Service
 ```
 
-**数据路径**: LiteLLM -> Tailscale P2P 直连 -> `100.105.130.0:6379`（free-arm-vm 节点 IP），**不过 KIC/Ingress**。Redis 用 `hostNetwork` 直接绑节点 6379 端口，无 NodePort 映射层。约 168ms 延迟对 prompt 缓存场景完全可接受（LLM 调用本身是秒级）。
+**数据路径 (LiteLLM -> Redis)**：`LiteLLM -> Tailscale -> Kong Gateway :6379 (L4 Stream 透传) -> TCPIngress 路由 -> Redis ClusterIP Service -> Redis Pod (free-arm-vm)`。
+
+- Kong 以 DaemonSet 运行在每个节点，`proxy.stream` 已开启 6379 端口 L4 透传，客户端连任意节点 `:6379` 均可达
+- Redis 通过 `TCPIngress` (Kong CRD) 暴露，不直接绑定节点端口，网络路径统一收口到网关层（后续可加认证/审计/限流）
+- 约 168ms 延迟对 prompt 缓存场景完全可接受（LLM 调用本身是秒级）
 
 **设计原则**: 无状态应用（LiteLLM）在 GCP 伦敦（随时可回收）；有状态数据（Redis/MySQL）在 OCI 新加坡（Always Free 稳定区）。
 
-**LiteLLM 侧启用 Redis 缓存配置** (config.yaml):
+## 部署方案：ArgoCD GitOps
+
+### 组件清单
+
+| 组件 | 位置 | 说明 |
+|------|------|------|
+| Redis Manifest | 本仓库 `k8s/redis.yaml` | Deployment + PVC + Service，nodeSelector 钉 free-arm-vm |
+| ArgoCD Application | `my-argocd-manifests/argocd-apps/redis-app.yaml` | 指向本仓库 `k8s/` 目录，目标集群 tencent-dp1-cluster |
+| Kong TCPIngress | `my-argocd-manifests/` 或本仓库 | 把 Kong 6379 Stream 转发到 Redis Service |
+
+### 部署流程（三步）
+
+```bash
+# 1. 确保 Kong 已开启 6379 Stream (kong-controller-app.yaml 已配置 proxy.stream)
+#    确认: kubectl -n kong-system get svc kong-ingress-controller-kong-proxy
+#          6379:30745/TCP 已监听
+
+# 2. 在 my-argocd-manifests/argocd-apps/ 添加 redis-app.yaml:
+#    apiVersion: argoproj.io/v1alpha1
+#    kind: Application
+#    metadata:
+#      name: redis
+#      namespace: argocd
+#      annotations:
+#        argocd.argoproj.io/sync-wave: "3"   # 在 Kong 之后
+#    spec:
+#      project: default
+#      source:
+#        repoURL: 'https://github.com/nvd11/redis-deployment.git'
+#        path: k8s
+#        targetRevision: HEAD
+#      destination:
+#        name: 'tencent-dp1-cluster'
+#        namespace: redis
+#      syncPolicy:
+#        automated:
+#          prune: true
+#          selfHeal: true
+#        syncOptions:
+#          - CreateNamespace=true
+
+# 3. 配置 Redis 密码 Secret (先于 ArgoCD 同步，或首次同步后手动创建)
+kubectl create secret generic redis-secret \
+  --from-literal=redis-password='YOUR_STRONG_PASSWORD' -n redis
+
+# 推送后 ArgoCD 自动同步 (≤3 分钟)，确认:
+kubectl -n redis get pods -o wide    # redis pod 应调度到 free-arm-vm
+kubectl -n redis get svc             # redis ClusterIP Service
+```
+
+### 连接验证 (LiteLLM 侧)
+
+```bash
+# 方式 1: 走 Kong Gateway (推荐, 生产路径)
+redis-cli -h <任意节点 Tailscale IP> -p 6379 -a YOUR_STRONG_PASSWORD ping   # PONG
+# 例如: redis-cli -h 100.105.130.0 -p 6379 -a ... ping   (free-arm-vm)
+#        redis-cli -h 100.77.64.95 -p 6379 -a ... ping    (腾讯云节点, 同样可达)
+
+# 方式 2: 集群内直连 (Kong 未就绪时临时用)
+kubectl -n redis exec deploy/redis -- redis-cli -a $PASS --no-auth-warning ping
+```
+
+**LiteLLM 侧配置** (config.yaml):
 
 ```yaml
 cache: true
 cache_params:
   type: redis
-  host: 100.105.130.0
+  host: <Kong 节点 Tailscale IP>   # 如 100.105.130.0 (free-arm-vm)
   port: 6379
   password: YOUR_STRONG_PASSWORD
 ```
 
-连接参数: host `100.105.130.0`, port `6379`, 密码通过环境变量注入（勿写入明文配置文件）。
+## 为什么走 Kong Gateway 而不是 hostNetwork 直连
 
-## Kubernetes (K3s) 部署 —— 当前方案
+| 对比项 | hostNetwork 直连 (旧方案) | Kong Gateway L4 Stream (当前方案) |
+|--------|--------------------------|----------------------------------|
+| 端口暴露 | Redis 直绑节点 6379 | 统一由 Kong 管理，Redis 只暴露 ClusterIP |
+| 安全 | Redis 裸奔节点端口 | 网关层统一收口，可加认证/审计 |
+| 高可用 | 单节点，挂了就断 | 3 节点 Kong DaemonSet 都能转发 |
+| 运维 | 每台机器单独管理 | GitOps 声明式，改代码即生效 |
+
+## Kubernetes (K3s) 部署细节
 
 ### Manifest: `k8s/redis.yaml`
 
 ```bash
-# 1. 替换密码 (或从 secrets 管理注入)
-kubectl create secret generic redis-secret \
-  --from-literal=redis-password='YOUR_STRONG_PASSWORD' -n redis
-
-# 2. 部署
+# 手动方式 (不依赖 ArgoCD 时)
 kubectl apply -f k8s/redis.yaml
 
-# 3. 确认调度到 free-arm-vm
+# 确认调度到 free-arm-vm
 kubectl -n redis get pods -o wide
-
-# 4. 从集群外验证 (LiteLLM 所在机器或任意 Tailscale 节点)
-redis-cli -h 100.105.130.0 -p 6379 -a YOUR_STRONG_PASSWORD ping   # 应返回 PONG
 ```
 
 ### K8s Manifest 要点
 
 | 项目 | 配置 | 说明 |
 |------|------|------|
-| 网络 | `hostNetwork: true` | 直接绑节点 6379，外部经 Tailscale IP 直连，不过 KIC |
 | 调度 | `nodeSelector: kubernetes.io/hostname=free-arm-vm` | 钉在 OCI ARM worker，避免跨架构/跨区域漂移 |
+| 网络 | ClusterIP Service (6379) | 不再用 hostNetwork，统一经 Kong 暴露 |
 | 持久化 | `local-path` PVC (10Gi) | K3s 自带存储类，数据落 free-arm-vm 本地磁盘 |
 | 高可用 | 单副本 + liveness/readiness 探针 | 实验场景；需要 HA 时改 StatefulSet + 多副本 + 主从 |
 | 密码 | Secret 注入 | `CHANGE_ME` 占位符必须替换 |
@@ -148,6 +218,42 @@ free-arm-vm 上的 Redis 更新 (拉新镜像/改配置/滚动)
 - API 调用是**传输方式** (HTTP POST)
 - workflow 通过 `types: [update-image-tag]` 精确订阅自己关心的事件类型
 
+## Kong Gateway 连接细节
+
+### 前置条件
+
+- Kong Controller 已按 DaemonSet 部署且 `proxy.stream` 包含 6379 (见 `my-argocd-manifests/argocd-apps/kong-controller-app.yaml`)
+- `TCPIngress` CRD 已安装 (Kong chart 附带, `tcpingresses.configuration.konghq.com`)
+
+### TCPIngress 示例 (待添加到 GitOps)
+
+```yaml
+apiVersion: configuration.konghq.com/v1beta1
+kind: TCPIngress
+metadata:
+  name: redis-tcp
+  namespace: redis
+  annotations:
+    kubernetes.io/ingress.class: kong
+spec:
+  rules:
+    - port: 6379
+      backend:
+        serviceName: redis
+        servicePort: 6379
+```
+
+推送后 ArgoCD/Kong Controller 自动同步, 客户端连任意节点 `:6379` 即被转发到 Redis Service。
+
+### 验证 Kong 6379 连通性
+
+```bash
+# 三个节点 6379 均应开放 (Kong Stream 监听)
+for ip in 100.77.64.95 100.105.130.0 100.104.150.19; do
+  timeout 5 bash -c "echo > /dev/tcp/$ip/6379" && echo "$ip:6379 → 开放" || echo "$ip:6379 → 不通"
+done
+```
+
 ## 备选: Docker Compose 方式
 
 ```bash
@@ -177,18 +283,19 @@ sudo bash scripts/healthcheck.sh
 
 ## 安全须知
 
-- Redis 默认仅绑定 Tailscale/内网可达地址，**不要**直接暴露公网 6379
-- 需要公网访问时：nginx 反代 + Basic Auth -> RedisInsight (5540)，Redis 本身保持私网
+- Redis 通过 Kong Gateway 暴露，Redis 本身只暴露 ClusterIP；**不要**将 Redis 直接暴露公网 6379
+- 公网访问必须走 Kong + 认证层（Basic Auth / Kong ACL），Redis 保持私网
 - 密码一律通过 Secret/`.env` 管理，**绝不入库**
 - K8s 集群内 `kubectl` 访问权限要收敛（Redis 密码在 Secret 中可见）
+- TCPIngress 的 backend 指向 Redis Service，端口号要一致（6379）
 
 ## 环境速查
 
 | 组件 | 位置 | 地址 |
 |------|------|------|
 | LiteLLM Proxy | GCP 伦敦 europe-west2-c | Alice VM (Tailscale 100.94.13.17) |
-| Redis | OCI 新加坡 ap-singapore-1 | free-arm-vm, `100.105.130.0:6379` |
+| Redis | OCI 新加坡 ap-singapore-1 | free-arm-vm, ClusterIP Service `redis:6379` |
+| Kong 入口 | 3 节点 DaemonSet | `:6379` (任意节点 Tailscale IP 均可) |
 | MySQL (计费) | OCI Singapore | rin-heatwave, `10.0.0.247:3306` |
 | K3s 集群 | 腾讯云 + OCI + NUC | 3 节点 (vm-0-2-debian / free-arm-vm / nuc) |
-| KIC (Kong) | 腾讯云 K3s | kong-system namespace (HTTP 网关, 与 Redis 无关) |
 | ArgoCD | 阿里云 K3s | root-bootstrap (App-of-Apps), 管理 5+ 子应用 |
