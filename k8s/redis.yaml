@@ -26,9 +26,20 @@ metadata:
   name: redis-secret
   namespace: redis
 type: Opaque
+# ============================================================
+# 密码管理说明 (重要)
+# - 这里用 stringData 写的是【占位符】, API server 部署时自动
+#   转成 data (base64) 存储, 集群里只有 data, 没有 stringData
+# - 真实密码不在 Git 里, 通过 kubectl patch 注入集群 etcd:
+#     kubectl -n redis patch secret redis-secret --type merge \
+#       -p '{"data":{"redis-password":"$(echo -n 真密码 | base64)"}}'
+# - ArgoCD 的 redis app 已配置 ignoreDifferences /data
+#   (见 my-argocd-manifests/argocd-apps/redis-app.yaml),
+#   selfHeal 不会把 data 拉回占位符
+# - 换密码: patch Secret 后必须 rollout restart deploy/redis
+#   (env 注入只在 pod 创建时生效, 不热更新)
+# ============================================================
 stringData:
-  # TODO: 替换为强密码，或从外部 secrets 管理注入
-  # kubectl create secret generic redis-secret --from-literal=redis-password='CHANGE_ME' -n redis
   redis-password: CHANGE_ME
 ---
 apiVersion: v1
