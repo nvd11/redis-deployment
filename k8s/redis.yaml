@@ -102,26 +102,35 @@ spec:
           resources:
             requests:
               cpu: 100m
-              memory: 256Mi
+              memory: 512Mi
             limits:
               cpu: "2"
-              memory: 4Gi
+              memory: 8Gi
+          startupProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - redis-cli -a "$REDIS_PASSWORD" --no-auth-warning ping | grep -q PONG
+            failureThreshold: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
           livenessProbe:
             exec:
               command:
                 - sh
                 - -c
                 - redis-cli -a "$REDIS_PASSWORD" --no-auth-warning ping | grep -q PONG
-            initialDelaySeconds: 10
             periodSeconds: 15
+            timeoutSeconds: 5
           readinessProbe:
             exec:
               command:
                 - sh
                 - -c
                 - redis-cli -a "$REDIS_PASSWORD" --no-auth-warning ping | grep -q PONG
-            initialDelaySeconds: 5
             periodSeconds: 10
+            timeoutSeconds: 5
       volumes:
         - name: redis-data
           persistentVolumeClaim:
