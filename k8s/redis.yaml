@@ -82,9 +82,13 @@ spec:
           command:
             - redis-server
             - --appendonly
-            - "yes"
-            - --appendfsync
-            - everysec
+            - "no"
+            - --save
+            - "900 1 300 10"
+            - --maxmemory
+            - "2gb"
+            - --maxmemory-policy
+            - "volatile-lru"
             - --requirepass
             - "$(REDIS_PASSWORD)"
           env:
@@ -102,10 +106,10 @@ spec:
           resources:
             requests:
               cpu: 100m
-              memory: 512Mi
+              memory: 256Mi
             limits:
               cpu: "2"
-              memory: 8Gi
+              memory: 3Gi
           startupProbe:
             exec:
               command:
