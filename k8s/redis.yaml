@@ -39,8 +39,7 @@ type: Opaque
 # - 换密码: patch Secret 后必须 rollout restart deploy/redis
 #   (env 注入只在 pod 创建时生效, 不热更新)
 # ============================================================
-stringData:
-  redis-password: CHANGE_ME
+data: {}
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
