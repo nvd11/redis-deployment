@@ -84,7 +84,7 @@ spec:
             - --appendonly
             - "no"
             - --save
-            - "900 1 300 10"
+            - ""
             - --maxmemory
             - "2gb"
             - --maxmemory-policy
@@ -173,3 +173,50 @@ spec:
       backend:
         serviceName: redis
         servicePort: 6379
+---
+# ============================================================
+# Daily Redis BGSAVE Snapshot at HKT 06:00 (UTC 22:00)
+# ============================================================
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: redis-daily-backup
+  namespace: redis
+  labels:
+    app: redis-backup
+spec:
+  # HKT 06:00 is UTC 22:00 (every day at 22:00 UTC)
+  schedule: "0 22 * * *"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      template:
+        metadata:
+          labels:
+            app: redis-backup
+        spec:
+          restartPolicy: OnFailure
+          nodeSelector:
+            kubernetes.io/hostname: free-arm-vm
+          containers:
+            - name: bgsave-trigger
+              image: redis:7.2-alpine
+              command:
+                - sh
+                - -c
+                - |
+                  echo "[$(date -u)] Triggering daily Redis bgsave (HKT 06:00)..."
+                  redis-cli -h redis.redis.svc.cluster.local -p 6379 -a "$REDIS_PASSWORD" --no-auth-warning bgsave
+                  echo "Waiting for bgsave to complete..."
+                  while [ "$(redis-cli -h redis.redis.svc.cluster.local -p 6379 -a "$REDIS_PASSWORD" --no-auth-warning info persistence | grep rdb_bgsave_in_progress | tr -d '\r\n')" = "rdb_bgsave_in_progress:1" ]; do
+                    sleep 1
+                  done
+                  echo "[$(date -u)] Daily bgsave completed successfully!"
+              env:
+                - name: REDIS_PASSWORD
+                  valueFrom:
+                    secretKeyRef:
+                      name: redis-secret
+                      key: redis-password
